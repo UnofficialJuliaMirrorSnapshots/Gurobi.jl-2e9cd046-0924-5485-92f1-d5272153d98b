@@ -3,13 +3,25 @@ const MOIT = MOI.Test
 
 const GUROBI_ENV = Gurobi.Env()
 const OPTIMIZER = MOI.Bridges.full_bridge_optimizer(
-    Gurobi.Optimizer(GUROBI_ENV, OutputFlag=0), Float64
+    # Note: we set `DualReductions = 0` so that we never return
+    # `INFEASIBLE_OR_UNBOUNDED`.
+    Gurobi.Optimizer(GUROBI_ENV, OutputFlag=0, DualReductions=0), Float64
 )
 
 const CONFIG = MOIT.TestConfig()
 
 @testset "Unit Tests" begin
-    MOIT.basic_constraint_tests(OPTIMIZER, CONFIG)
+    MOIT.basic_constraint_tests(OPTIMIZER, CONFIG; exclude = [
+        (MOI.VectorOfVariables, MOI.GeometricMeanCone)
+    ])
+    # get(::ConstraintFunction) and get(::ConstraintSet) haven't been
+    # implemented for the geomean bridge in MOI.
+    MOIT.basic_constraint_tests(OPTIMIZER, CONFIG; include = [
+            (MOI.VectorOfVariables, MOI.GeometricMeanCone)
+        ],
+        get_constraint_function = false,
+        get_constraint_set = false
+    )
     MOIT.unittest(OPTIMIZER, MOIT.TestConfig(atol=1e-6))
     MOIT.modificationtest(OPTIMIZER, CONFIG)
 end
@@ -32,8 +44,15 @@ end
     ])
 end
 
-@testset "Linear Conic tests" begin
+@testset "Conic tests" begin
     MOIT.lintest(OPTIMIZER, CONFIG)
+    MOIT.soctest(OPTIMIZER, MOIT.TestConfig(duals = false, atol=1e-3), ["soc3"])
+    MOIT.soc3test(
+        OPTIMIZER,
+        MOIT.TestConfig(duals = false, infeas_certificates = false, atol = 1e-3)
+    )
+    MOIT.rsoctest(OPTIMIZER, MOIT.TestConfig(duals = false, atol=1e-3))
+    MOIT.geomeantest(OPTIMIZER, MOIT.TestConfig(duals = false, atol=1e-3))
 end
 
 @testset "Integer Linear tests" begin
@@ -652,4 +671,241 @@ c3: x in Integer()
         ArgumentError("Attribute BranchPriority is Integer but Float64 provided."),
         MOI.set(model, Gurobi.VariableAttribute("BranchPriority"), x, 1.0)
     )
+end
+
+@testset "ModelAttribute" begin
+    model = Gurobi.Optimizer(GUROBI_ENV)
+    MOI.Utilities.loadfromstring!(model, """
+variables: x
+minobjective: x
+c1: x >= 0.0
+c2: 2x >= 1.0
+c3: x in Integer()
+""")
+    # Setting attributes of each type
+    # Integer attribute
+    MOI.set(model, Gurobi.ModelAttribute("ModelSense"), -1)
+    @test MOI.get(model, Gurobi.ModelAttribute("ModelSense")) == -1
+    # Real Attribute
+    MOI.set(model, Gurobi.ModelAttribute("ObjCon"), 3.0)
+    @test MOI.get(model, Gurobi.ModelAttribute("ObjCon")) == 3.0
+    # String Attribute
+    MOI.set(model, Gurobi.ModelAttribute("ModelName"), "My model")
+    @test MOI.get(model, Gurobi.ModelAttribute("ModelName")) == "My model"
+    # Things that should fail follow.
+    # Getting/setting a non-existing attribute.
+    attr = Gurobi.ModelAttribute("Non-existing")
+    @test_throws MOI.UnsupportedAttribute(attr) MOI.set(model, attr, 1)
+    @test_throws MOI.UnsupportedAttribute(attr) MOI.get(model, attr)
+    # Setting an attribute to a value of the wrong type.
+    @test_throws(
+        ArgumentError("Attribute NumStart is Integer but Float64 provided."),
+        MOI.set(model, Gurobi.ModelAttribute("NumStart"), 4.0)
+    )
+end
+
+@testset "SOC hide lower bound constraint" begin
+    model = Gurobi.Optimizer(GUROBI_ENV, OutputFlag=0)
+    @testset "No initial bound" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        c_soc = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_soc)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+    end
+    @testset "non-negative initial bound" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(1.0))
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        c_soc = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_soc)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 1.0
+    end
+    @testset "negative initial bound" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(-1.0))
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        c_soc = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        MOI.optimize!(model)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_soc)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == -1.0
+    end
+    @testset "non-negative post bound" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        c_lb = MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(6.0))
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 6.0
+        MOI.delete(model, c_lb)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+    end
+    @testset "negative post bound" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        c_soc = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(-6.0))
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_soc)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == -6.0
+    end
+    @testset "negative post bound II" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.(3.0:4.0)
+        )
+        c_soc = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t; x]), MOI.SecondOrderCone(3)
+        )
+        c_lb = MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(-6.0))
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_lb)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 5.0
+        MOI.delete(model, c_soc)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.TerminationStatus()) == MOI.DUAL_INFEASIBLE
+    end
+    @testset "2 SOC's" begin
+        MOI.empty!(model)
+        t = MOI.add_variable(model)
+        x = MOI.add_variables(model, 2)
+        MOI.add_constraint(model, MOI.SingleVariable(t), MOI.GreaterThan(-1.0))
+        MOI.add_constraints(
+            model, MOI.SingleVariable.(x), MOI.GreaterThan.([4.0, 3.0])
+        )
+        c_soc_1 = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t, x[1]]), MOI.SecondOrderCone(2)
+        )
+        c_soc_2 = MOI.add_constraint(
+            model, MOI.VectorOfVariables([t, x[2]]), MOI.SecondOrderCone(2)
+        )
+        MOI.optimize!(model)
+        MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(t))
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 4.0
+        MOI.delete(model, c_soc_1)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == 3.0
+        MOI.delete(model, c_soc_2)
+        MOI.optimize!(model)
+        @test MOI.get(model, MOI.VariablePrimal(), t) == -1.0
+    end
+end
+
+@testset "Duplicate names" begin
+    @testset "Variables" begin
+        model = Gurobi.Optimizer(GUROBI_ENV)
+        (x, y, z) = MOI.add_variables(model, 3)
+        MOI.set(model, MOI.VariableName(), x, "x")
+        MOI.set(model, MOI.VariableName(), y, "x")
+        MOI.set(model, MOI.VariableName(), z, "z")
+        @test MOI.get(model, MOI.VariableIndex, "z") == z
+        @test_throws ErrorException MOI.get(model, MOI.VariableIndex, "x")
+        MOI.set(model, MOI.VariableName(), y, "y")
+        @test MOI.get(model, MOI.VariableIndex, "x") == x
+        @test MOI.get(model, MOI.VariableIndex, "y") == y
+        MOI.set(model, MOI.VariableName(), z, "x")
+        @test_throws ErrorException MOI.get(model, MOI.VariableIndex, "x")
+        MOI.delete(model, x)
+        @test MOI.get(model, MOI.VariableIndex, "x") == z
+    end
+    @testset "SingleVariable" begin
+        model = Gurobi.Optimizer(GUROBI_ENV)
+        x = MOI.add_variables(model, 3)
+        c = MOI.add_constraints(model, MOI.SingleVariable.(x), MOI.GreaterThan(0.0))
+        MOI.set(model, MOI.ConstraintName(), c[1], "x")
+        MOI.set(model, MOI.ConstraintName(), c[2], "x")
+        MOI.set(model, MOI.ConstraintName(), c[3], "z")
+        @test MOI.get(model, MOI.ConstraintIndex, "z") == c[3]
+        @test_throws ErrorException MOI.get(model, MOI.ConstraintIndex, "x")
+        MOI.set(model, MOI.ConstraintName(), c[2], "y")
+        @test MOI.get(model, MOI.ConstraintIndex, "x") == c[1]
+        @test MOI.get(model, MOI.ConstraintIndex, "y") == c[2]
+        MOI.set(model, MOI.ConstraintName(), c[3], "x")
+        @test_throws ErrorException MOI.get(model, MOI.ConstraintIndex, "x")
+        MOI.delete(model, c[1])
+        @test MOI.get(model, MOI.ConstraintIndex, "x") == c[3]
+        MOI.set(model, MOI.ConstraintName(), c[2], "x")
+        @test_throws ErrorException MOI.get(model, MOI.ConstraintIndex, "x")
+        MOI.delete(model, x[3])
+        @test MOI.get(model, MOI.ConstraintIndex, "x") == c[2]
+    end
+    @testset "ScalarAffineFunction" begin
+        model = Gurobi.Optimizer(GUROBI_ENV)
+        x = MOI.add_variables(model, 3)
+        fs = [
+            MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(1.0, xi)], 0.0)
+            for xi in x
+        ]
+        c = MOI.add_constraints(model, fs, MOI.GreaterThan(0.0))
+        MOI.set(model, MOI.ConstraintName(), c[1], "x")
+        MOI.set(model, MOI.ConstraintName(), c[2], "x")
+        MOI.set(model, MOI.ConstraintName(), c[3], "z")
+        @test MOI.get(model, MOI.ConstraintIndex, "z") == c[3]
+        @test_throws ErrorException MOI.get(model, MOI.ConstraintIndex, "x")
+        MOI.set(model, MOI.ConstraintName(), c[2], "y")
+        @test MOI.get(model, MOI.ConstraintIndex, "x") == c[1]
+        @test MOI.get(model, MOI.ConstraintIndex, "y") == c[2]
+        MOI.set(model, MOI.ConstraintName(), c[3], "x")
+        @test_throws ErrorException MOI.get(model, MOI.ConstraintIndex, "x")
+        MOI.delete(model, c[1])
+        @test MOI.get(model, MOI.ConstraintIndex, "x") == c[3]
+    end
 end
