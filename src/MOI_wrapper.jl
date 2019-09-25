@@ -306,10 +306,11 @@ function MOI.get(model::Optimizer, ::MOI.ListOfVariableAttributesSet)
 end
 
 function MOI.get(model::Optimizer, ::MOI.ListOfModelAttributesSet)
-    attributes = [
-        MOI.ObjectiveSense(),
-        MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}()
-    ]
+    attributes = Any[MOI.ObjectiveSense()]
+    typ = MOI.get(model, MOI.ObjectiveFunctionType())
+    if typ !== nothing
+        push!(attributes, MOI.ObjectiveFunction{typ}())
+    end
     if MOI.get(model, MOI.Name()) != ""
         push!(attributes, MOI.Name())
     end
@@ -510,6 +511,16 @@ end
 ### Objectives
 ###
 
+function _zero_objective(model::Optimizer)
+    num_vars = length(model.variable_info)
+    obj = zeros(Float64, num_vars)
+    _update_if_necessary(model)
+    delq!(model.inner)
+    set_dblattrarray!(model.inner, "Obj", 1, num_vars, obj)
+    set_dblattr!(model.inner, "ObjCon", 0.0)
+    _require_update(model)
+end
+
 function MOI.set(
     model::Optimizer, ::MOI.ObjectiveSense, sense::MOI.OptimizationSense
 )
@@ -520,6 +531,7 @@ function MOI.set(
         set_sense!(model.inner, :maximize)
         model.is_feasibility = false
     elseif sense == MOI.FEASIBILITY_SENSE
+        _zero_objective(model)
         set_sense!(model.inner, :minimize)
         model.is_feasibility = true
     else
@@ -1882,12 +1894,22 @@ function MOI.get(
     model::Optimizer, ::MOI.ConstraintDual,
     c::MOI.ConstraintIndex{MOI.SingleVariable, MOI.LessThan{Float64}}
 )
-    column = _info(model, c).column
-    x = get_dblattrelement(model.inner, "X", column)
-    ub = get_dblattrelement(model.inner, "UB", column)
-    if x ≈ ub
-        return _dual_multiplier(model) * get_dblattrelement(model.inner, "RC", column)
+    reduced_cost = get_dblattrelement(model.inner, "RC", _info(model, c).column)
+    sense = MOI.get(model, MOI.ObjectiveSense())
+    # The following is a heuristic for determining whether the reduced cost
+    # applies to the lower or upper bound. It can be wrong by at most
+    # `FeasibilityTol`.
+    if sense == MOI.MIN_SENSE && reduced_cost < 0
+        # If minimizing, the reduced cost must be negative (ignoring
+        # tolerances).
+        return reduced_cost
+    elseif sense == MOI.MAX_SENSE && reduced_cost > 0
+        # If minimizing, the reduced cost must be positive (ignoring
+        # tolerances). However, because of the MOI dual convention, we return a
+        # negative value.
+        return -reduced_cost
     else
+        # The reduced cost, if non-zero, must related to the lower bound.
         return 0.0
     end
 end
@@ -1896,12 +1918,22 @@ function MOI.get(
     model::Optimizer, ::MOI.ConstraintDual,
     c::MOI.ConstraintIndex{MOI.SingleVariable, MOI.GreaterThan{Float64}}
 )
-    info = _info(model, c)
-    x = get_dblattrelement(model.inner, "X", info.column)
-    lb = _get_variable_lower_bound(model, info)
-    if x ≈ lb
-        return _dual_multiplier(model) * get_dblattrelement(model.inner, "RC", info.column)
+    reduced_cost = get_dblattrelement(model.inner, "RC", _info(model, c).column)
+    sense = MOI.get(model, MOI.ObjectiveSense())
+    # The following is a heuristic for determining whether the reduced cost
+    # applies to the lower or upper bound. It can be wrong by at most
+    # `FeasibilityTol`.
+    if sense == MOI.MIN_SENSE && reduced_cost > 0
+        # If minimizing, the reduced cost must be negative (ignoring
+        # tolerances).
+        return reduced_cost
+    elseif sense == MOI.MAX_SENSE && reduced_cost < 0
+        # If minimizing, the reduced cost must be positive (ignoring
+        # tolerances). However, because of the MOI dual convention, we return a
+        # negative value.
+        return -reduced_cost
     else
+        # The reduced cost, if non-zero, must related to the lower bound.
         return 0.0
     end
 end
@@ -1989,10 +2021,9 @@ function MOI.set(
 )
     info = _info(model, x)
     info.start = value
-    if value !== nothing
-        set_dblattrelement!(model.inner, "Start", info.column, value)
-        _require_update(model)
-    end
+    grb_value = value !== nothing ? value : GRB_UNDEFINED
+    set_dblattrelement!(model.inner, "Start", info.column, grb_value)
+    _require_update(model)
     return
 end
 
@@ -2130,8 +2161,10 @@ function MOI.get(model::Optimizer, ::MOI.ListOfConstraints)
 end
 
 function MOI.get(model::Optimizer, ::MOI.ObjectiveFunctionType)
-    if model.objective_type == SINGLE_VARIABLE
-        return MOI.SINGLE_VARIABLE
+    if model.is_feasibility
+        return nothing
+    elseif model.objective_type == SINGLE_VARIABLE
+        return MOI.SingleVariable
     elseif model.objective_type == SCALAR_AFFINE
         return MOI.ScalarAffineFunction{Float64}
     else

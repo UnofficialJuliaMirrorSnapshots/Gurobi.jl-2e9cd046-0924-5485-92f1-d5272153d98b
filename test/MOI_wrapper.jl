@@ -105,10 +105,20 @@ end
         model = Gurobi.Optimizer(GUROBI_ENV, OutputFlag = 0)
         x = MOI.add_variables(model, 2)
         @test MOI.supports(model, MOI.VariablePrimalStart(), MOI.VariableIndex)
+        @test MOI.get(model, MOI.VariablePrimalStart(), x[1]) === nothing
+        @test MOI.get(model, MOI.VariablePrimalStart(), x[2]) === nothing
+        Gurobi._update_if_necessary(model)
+        @test Gurobi.get_dblattrelement(
+            model.inner, "Start", Gurobi._info(model, x[1]).column
+        ) == Gurobi.GRB_UNDEFINED
         MOI.set(model, MOI.VariablePrimalStart(), x[1], 1.0)
         MOI.set(model, MOI.VariablePrimalStart(), x[2], nothing)
         @test MOI.get(model, MOI.VariablePrimalStart(), x[1]) == 1.0
         @test MOI.get(model, MOI.VariablePrimalStart(), x[2]) === nothing
+        Gurobi._update_if_necessary(model)
+        @test Gurobi.get_dblattrelement(
+            model.inner, "Start", Gurobi._info(model, x[2]).column
+        ) == Gurobi.GRB_UNDEFINED
         MOI.optimize!(model)
         @test MOI.get(model, MOI.ObjectiveValue()) == 0.0
         # We don't support ConstraintDualStart or ConstraintPrimalStart yet.
@@ -908,4 +918,42 @@ end
         MOI.delete(model, c[1])
         @test MOI.get(model, MOI.ConstraintIndex, "x") == c[3]
     end
+end
+
+@testset "Duals with equal bounds #250" begin
+    model = Gurobi.Optimizer(GUROBI_ENV, OutputFlag=0)
+    x = MOI.add_variable(model)
+    xl = MOI.add_constraint(model, MOI.SingleVariable(x), MOI.GreaterThan(1.0))
+    xu = MOI.add_constraint(model, MOI.SingleVariable(x), MOI.LessThan(1.0))
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(x))
+    MOI.optimize!(model)
+    @test MOI.get(model, MOI.ConstraintDual(), xl) == 1.0
+    @test MOI.get(model, MOI.ConstraintDual(), xu) == 0.0
+end
+
+@testset "Objective functions" begin
+    model = Gurobi.Optimizer(GUROBI_ENV)
+    x = MOI.add_variable(model)
+    @test MOI.get(model, MOI.ObjectiveSense()) == MOI.FEASIBILITY_SENSE
+    @test MOI.get(model, MOI.ListOfModelAttributesSet()) == Any[MOI.ObjectiveSense()]
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(x))
+    @test MOI.get(model, MOI.ListOfModelAttributesSet()) ==
+        Any[MOI.ObjectiveSense(), MOI.ObjectiveFunction{MOI.SingleVariable}()]
+    MOI.set(model, MOI.ObjectiveSense(), MOI.FEASIBILITY_SENSE)
+    @test MOI.get(model, MOI.ListOfModelAttributesSet()) == Any[MOI.ObjectiveSense()]
+end
+
+@testset "FEASIBILITY_SENSE zeros objective" begin
+    model = Gurobi.Optimizer(GUROBI_ENV, OutputFlag=0)
+    x = MOI.add_variable(model)
+    MOI.add_constraint(model, MOI.SingleVariable(x), MOI.GreaterThan(1.0))
+    MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    MOI.set(model, MOI.ObjectiveFunction{MOI.SingleVariable}(), MOI.SingleVariable(x))
+    MOI.optimize!(model)
+    @test MOI.get(model, MOI.ObjectiveValue()) == 1.0
+    MOI.set(model, MOI.ObjectiveSense(), MOI.FEASIBILITY_SENSE)
+    MOI.optimize!(model)
+    @test MOI.get(model, MOI.ObjectiveValue()) == 0.0
 end
